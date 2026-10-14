@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from datetime import datetime
 from typing import Iterable
 
@@ -52,7 +53,8 @@ def market_snapshot() -> tuple[str, list[str]]:
     return "\n".join(lines), sorted(set(source_dates))
 
 
-def headlines(limit: int = 6) -> str:
+def headlines(limit: int = 3) -> str:
+    """Keep the AI input compact so the free-tier quota is used conservatively."""
     blocks: list[str] = []
     for category, url in NEWS_FEEDS.items():
         feed = feedparser.parse(url)
@@ -64,6 +66,17 @@ def headlines(limit: int = 6) -> str:
     return "\n\n".join(blocks)
 
 
+def fallback_briefing(index_text: str, dates: Iterable[str], news: str) -> str:
+    """Still deliver the market data if Gemini temporarily has no free-tier quota."""
+    today = datetime.now().strftime("%Y/%m/%d")
+    return (
+        f"📈 股市晨報｜{today}\n\n"
+        f"📊 指數（收盤日期：{', '.join(dates) or '未知'}）\n{index_text}\n\n"
+        "⚠️ AI 摘要暫時受免費配額限制，以下提供今日新聞標題：\n\n"
+        f"{news}"
+    )
+
+
 def create_briefing(index_text: str, dates: Iterable[str], news: str) -> str:
     today = datetime.now().strftime("%Y/%m/%d")
     prompt = f"""你是嚴謹的台灣市場晨報編輯。請只依據下列提供的指數資料與新聞標題，以繁體中文寫一則可直接貼到 Discord 的市場摘要。
@@ -71,12 +84,12 @@ def create_briefing(index_text: str, dates: Iterable[str], news: str) -> str:
 規則：
 1. 第一行必須是「📈 股市晨報｜{today}」。接著使用「📊 指數」並原樣列出所有指數資料。
 2. 接著固定使用三個小節：🌍 國際市場、🇺🇸 美股、🇹🇼 台股。
-3. 每節 2–3 個短條列，說明最重要的事件、可能影響或市場焦點；每點最多 60 個中文字。
+3. 每節 1–2 個短條列，說明最重要的事件、可能影響或市場焦點；每點最多 45 個中文字。
 4. 僅根據提供資料撰寫。資料不足時略過，不得杜撰數字、日期或新聞事實。
 5. 以中性語氣呈現，不能提供買賣建議，也不要提及你是 AI 或資料來源。
-6. 全文請控制在 1,300 個中文字元內；內容已簡短時不要為了湊格式而補充。
+6. 全文請控制在 900 個中文字元內。
 
-指數收盤日期：{", ".join(dates) or "未知"}
+指數收盤日期：{', '.join(dates) or '未知'}
 
 📊 指數表現
 {index_text}
@@ -85,11 +98,21 @@ def create_briefing(index_text: str, dates: Iterable[str], news: str) -> str:
 {news}
 """
     client = genai.Client(api_key=required("GEMINI_API_KEY"))
-    response = client.interactions.create(
-        model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
-        input=prompt,
-    )
-    return response.output_text.strip()
+    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+
+    # Retry once for short-lived rate limits, then preserve delivery with raw headlines.
+    for retry_delay in (0, 25):
+        if retry_delay:
+            time.sleep(retry_delay)
+        try:
+            response = client.interactions.create(model=model, input=prompt)
+            briefing = response.output_text.strip()
+            if briefing:
+                return briefing
+        except Exception as exc:  # Gemini returns 429 when the free quota is busy.
+            print(f"Gemini 摘要暫時無法取得：{exc}")
+
+    return fallback_briefing(index_text, dates, news)
 
 
 def post_discord(content: str) -> None:
